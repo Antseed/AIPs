@@ -3,7 +3,7 @@ aip: 6
 title: Referrals and Client Attribution
 description: Attributes recognized usage to client software and invite-based referrals through a buyer-signed metadata tail, and funds both from new emission buckets.
 author: Shahaf Antwarg (@kotevcode)
-discussions-to: https://github.com/AntSeed/antseed/pull/1080
+discussions-to: https://github.com/Antseed/antseed/pull/1080
 status: Draft
 type: Standards Track
 category: Contracts
@@ -43,7 +43,7 @@ channel:
 
 - **Client builders.** The software a buyer uses decides which network the
   buyer's requests go to. A third-party app that routes its users through
-  AntSeed has no on-chain identity in a settlement and earns nothing from the
+  Antseed has no on-chain identity in a settlement and earns nothing from the
   usage it brings.
 - **Referrers.** A wallet that brings a new buyer has no verifiable way to
   claim that it did.
@@ -52,7 +52,7 @@ Both need attribution that is deterministic, cannot be claimed by an outsider,
 works for free usage and for the CLI as well as the desktop app, and does not
 add gas or a new transaction for the buyer. Settlement metadata is the one
 place that satisfies all of these: the buyer already signs it for every
-settlement, the seller already submits it on-chain, and AntSeed already has a
+settlement, the seller already submits it on-chain, and Antseed already has a
 stats sink that receives it.
 
 Referral rewards are also an obvious target for self-dealing. A referral
@@ -631,7 +631,7 @@ needs no off-chain service to verify, and works for every client.
 ## Test Cases
 
 The reference test suites are in `packages/contracts/test` of
-[AntSeed/antseed#1080](https://github.com/AntSeed/antseed/pull/1080):
+[Antseed/antseed#1080](https://github.com/Antseed/antseed/pull/1080):
 
 - `AntseedStatsV2.t.sol`: tail detection on v3 and FreeUsage v1 layouts,
   zero result without a tail, the retired tail ignored, forwarding of client
@@ -697,7 +697,7 @@ word 12  0000000000000000000000000000000000000000000000000000000000000005  servi
 
 ## Reference Implementation
 
-[AntSeed/antseed#1080](https://github.com/AntSeed/antseed/pull/1080), in
+[Antseed/antseed#1080](https://github.com/Antseed/antseed/pull/1080), in
 `packages/contracts`:
 
 - `stats/AntseedStatsV2.sol`
