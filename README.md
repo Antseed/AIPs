@@ -75,7 +75,11 @@ those specifications are proposed, debated, and finalized.
 | Number | Title | Type | Status |
 |-------:|-------|------|--------|
 | [1](AIPS/aip-1.md) | AIP Purpose and Guidelines | Meta | Living |
-| [2](AIPS/aip-2.md) | Recognized Usage Trust | Standards Track | Draft |
+| [2](AIPS/aip-2.md) | Recognized Usage Trust | Standards Track | Final |
+| [3](AIPS/aip-3.md) | Pluggable Verifier SDKs | Standards Track | Final |
+| [4](AIPS/aip-4.md) | Proof-Carrying Wash-Trading Enforcement | Standards Track | Final |
+| [5](AIPS/aip-5.md) | Model Routing Peers | Standards Track | Draft |
+| [6](AIPS/aip-6.md) | Referrals and Client Attribution | Standards Track | Review |
 
 ## Validation
 

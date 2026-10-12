@@ -4,7 +4,7 @@ title: Referrals and Client Attribution
 description: Attributes recognized usage to client software and invite-based referrals through a buyer-signed metadata tail, and funds both from new emission buckets.
 author: Shahaf Antwarg (@kotevcode)
 discussions-to: https://github.com/Antseed/antseed/pull/1080
-status: Draft
+status: Review
 type: Standards Track
 category: Contracts
 created: 2026-10-04
@@ -134,7 +134,8 @@ values with or without a tail.
 #### Encoding rules for clients
 
 - A buyer client SHOULD include the tail in every SpendingAuth and FreeUsage
-  metadata it signs.
+  metadata it signs. It MAY omit the tail when `clientId` is zero and it
+  carries no invite, since that decodes to the same all-zero attribution.
 - `clientId` MUST be the client's ERC-8004 agent id, or zero when the client
   has none.
 - "No invite" MUST be encoded as `inviteR = 0` and `inviteVs = 0`. Clients
@@ -190,7 +191,11 @@ revert `recordMetadata`. The owner MAY set either sink to zero to disable it.
 
 `AntseedChannels` MUST call the stats sink before
 `IAntseedEmissions.accrueSellerPoints` / `accrueBuyerPoints` for the same
-settlement. The deployed `AntseedChannels._settleSpend` already does so.
+settlement. The deployed `AntseedChannels._settleSpend` already does so. It
+calls the sink only when the seller has a staked agent id
+(`staking.getAgentId(seller) > 0`), while points follow the seller pool's
+agent id; the two agree for every seller that earns points, so in practice
+every point-bearing settlement reaches Stats.
 
 ### AntseedAttributionUsage
 
@@ -323,9 +328,19 @@ The controllers pay nothing until the gate owner registers them with
 share takes effect from the next epoch and all shares MUST sum to at most
 `SHARE_DENOMINATOR = 100000`.
 
-The reference implementation does not define the minter ids or the share of
-either bucket; they are set through the gate's share configuration at
-registration. See [Open Issues](#open-issues).
+Both buckets are carved out of the AIP-2 verification bucket, so the total
+minter share does not change:
+
+| Bucket | Minter id | Share |
+| --- | --- | --- |
+| Verification (AIP-2) | `keccak256("antseed.emissions.verification.v1")` | 10% → 4% (`4000`) |
+| Client (builders) | `keccak256("antseed.emissions.client-rewards.v1")` | 4% (`4000`) |
+| Referral | `keccak256("antseed.emissions.referrals.v1")` | 2% (`2000`) |
+
+All three minters MUST be editable. The verification share MUST be lowered
+before the new minters are added, so the total never exceeds
+`SHARE_DENOMINATOR` between calls, and all three changes SHOULD land in the
+same epoch so they take effect together.
 
 #### Epoch share (AntseedEpochShareRewards)
 
@@ -373,12 +388,17 @@ the bucket. After the window the referrer earns all of it.
 #### Claims and recipients
 
 - `claim(referrer, epoch)` / `claimEpochs(referrer, epochs)` pay the
-  referrer's share to `referrerRecipient(referrer)`: the referrer's operator
-  if non-zero, else the referrer address itself (sellers and plain wallets).
+  referrer's share to the referrer's operator only, whether the referrer is a
+  buyer or a seller.
 - `claimReferee(buyer, epoch)` / `claimRefereeEpochs(buyer, epochs)` pay the
-  referee's share to the buyer's operator only. If the buyer has no operator
-  the claim MUST revert with `RewardRecipientUnavailable` without marking the
-  epoch claimed, so it can be retried once an operator is set.
+  referee's share to the buyer's operator only.
+- If the account has no operator, either claim MUST revert with
+  `RewardRecipientUnavailable` without marking the epoch claimed, so it can
+  be retried once an operator is set (`RewardRecipientUnavailable()`,
+  selector `0x9204c9a2`). Any account, buyer or seller, can set one with
+  `AntseedDeposits.setOperator`.
+- `referrerRecipient(referrer)` returns the referrer's operator, or zero when
+  none is set.
 - Referrer and referee claims MUST use distinct, role-tagged claim keys
   (`keccak256(abi.encode(keccak256("antseed.referrals.referrer"), account))`
   and `keccak256(abi.encode(keccak256("antseed.referrals.referee"), account))`),
@@ -386,8 +406,8 @@ the bucket. After the window the referrer earns all of it.
 - The batch variants skip epochs with nothing to pay and revert with
   `NothingToClaim` only if the whole batch paid nothing.
 
-A buyer hot wallet MUST NOT receive referee rewards; this is the same rule
-AIP-2 applies to buyer rewards.
+A hot wallet MUST NOT receive referral rewards in either role; this is the
+same rule AIP-2 applies to buyer rewards.
 
 ```solidity
 event ReferralBound(address indexed buyer, address indexed referrer, uint256 epoch, uint256 inviteEpoch, uint256 inviteIndex);
@@ -528,7 +548,8 @@ Deployment MUST follow this order:
    and `AntseedClientRewards(emissionsGate, attributionUsage, identityRegistry)`.
 4. Call `StatsV2.setAttributionUsage`, `StatsV2.setReferrals` and
    `AntseedAttributionUsage.setReferrals`.
-5. Register both controllers as gate minters.
+5. Register both controllers as gate minters with the shares above
+   (`script/RegisterAttributionMinters.s.sol`).
 6. Re-point `AntseedRegistry.setStats(StatsV2)`. Channels and FreeUsage
    resolve the stats address live.
 
@@ -537,18 +558,7 @@ forwards while a sink is unset are never attributed.
 
 ### Open Issues
 
-1. **Bucket ids and shares.** The repository defines no minter ids and no
-   share values for the referral and client buckets, and the AIP-2 default
-   shares already sum to 100%. Registering these buckets therefore requires
-   choosing their ids, their shares and which existing editable buckets give
-   up share. These values are undecided.
-2. **Reference client encoder.** The off-chain encoder in
-   `packages/protocol/src/signatures.ts` still emits the retired two-word
-   tail `(address referrer, bytes32 clientId)`, which `AntseedStatsV2`
-   ignores. It MUST be moved to the five-word tail of this AIP, with an
-   invite signer, and checked against the test vectors below before clients
-   rely on referral binding or client attribution.
-3. **Per-claimant cap.** Unlike AIP-2's direct usage rewards, neither new
+1. **Per-claimant cap.** Unlike AIP-2's direct usage rewards, neither new
    controller caps a single claimant's share of an epoch. Whether a cap is
    wanted is undecided.
 
@@ -578,6 +588,12 @@ cannot hand a backlog to a stale client or epoch.
 reason to accept an invite. Bounding that share to 12 epochs bounds what a
 self-referral through an undetectable sibling wallet can capture, while the
 referrer share persists because that is what any genuine referral earns.
+
+**Bucket sizes.** Both buckets come out of verification so the AIP-2 user
+buckets (seller pools and direct usage) keep their full ceilings. Builders get
+twice the referral bucket: a client keeps bringing usage for as long as it is
+used, while a referral is a one-time introduction whose referee share already
+ends after 12 epochs.
 
 **Activity-based quota and expiry.** Invites are bearer tokens, so their
 number has to be bounded. Tying the quota to the referrer's own recognized
@@ -651,10 +667,20 @@ The reference test suites are in `packages/contracts/test` of
 - `AntseedClientRewards.t.sol`: pro rata split by recognized points with
   agent-owner payout, the grace epoch before claimability, empty-epoch
   sweep, and the code-less registry guard.
-- `AntseedAttributionRewards.t.sol`: end-to-end integration through
-  Channels, Stats, the ledger and both controllers, including the 50/50 split
-  followed by referrer-only credit, rejected invites that leave settlement
-  intact, and one wallet holding both roles.
+- `RegisterAttributionMinters.t.sol`: the 4% / 4% / 2% split out of the
+  verification bucket with the total share unchanged, effective from the next
+  epoch, and refusal to run twice.
+- `AntseedAttributionRewards.t.sol`: integration of the real
+  `AntseedStatsV2`, ledger and `AntseedReferrals` behind a settlement writer
+  standing in for Channels, including the 50/50 split followed by
+  referrer-only credit, rejected invites that leave settlement intact, one
+  wallet holding both roles, client attribution in the ledger, and frozen
+  totals against late flushes.
+
+The off-chain reference encoder (`packages/protocol/src/signatures.ts`, the
+five-word tail) and invite signer (`packages/node/src/payments/invites.ts`)
+are checked against the same vectors in `signatures.test.ts` and
+`invites.test.ts`.
 
 A conforming implementation MUST reproduce these vectors.
 
@@ -706,7 +732,8 @@ word 12  0000000000000000000000000000000000000000000000000000000000000005  servi
 - `emissions/AntseedClientRewards.sol`
 - `rewards/AntseedReferrals.sol`
 - `script/DeployStatsV2.s.sol`, `script/DeployAttributionUsage.s.sol`,
-  `script/DeployReferrals.s.sol`, `script/DeployClientRewards.s.sol`
+  `script/DeployReferrals.s.sol`, `script/DeployClientRewards.s.sol`,
+  `script/RegisterAttributionMinters.s.sol`
 
 ## Security Considerations
 
@@ -768,10 +795,12 @@ epoch after it becomes claimable (`CREDIT_GRACE_EPOCHS` equals
 frozen total; late usage rolls forward instead. Each claim is also capped at
 the epoch's unminted budget, so the gate's bucket cap cannot be exceeded.
 
-**Recipient custody.** Referee rewards never go to a buyer hot wallet and
-revert while no operator is set. Referrer rewards fall back to the referrer
-address when no operator is set, which is intended for sellers and plain
-wallets. Client rewards follow ERC-8004 ownership at claim time, so an agent
+**Recipient custody.** Referral rewards, for referrers and referees alike,
+are paid only to the account's operator and revert while none is set, so a
+hot wallet, which signs requests and invites and may be exposed, never holds
+rewards. The cost is that a referrer without an operator, typically a seller,
+must set one before it can claim; unclaimed rewards wait and do not expire.
+Client rewards follow ERC-8004 ownership at claim time, so an agent
 transfer moves unclaimed client rewards to the new owner.
 
 ## Copyright
