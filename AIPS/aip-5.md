@@ -1,75 +1,48 @@
 ---
 aip: 5
 title: Model Routing Peers
-description: Defines the routing peer role, its discovery and reserved request paths, and the buyer-side router interface for cross-model routing.
-author: Marco De Rossi (@marcoderossi90), Dawid (@Dawe000)
+description: Defines routing as a paid seller service with pluggable protocols, where a router ranks the destinations a buyer allows and the buyer keeps control of dispatch.
+author: Marco De Rossi (@marcoderossi90), Dawid (@Dawe000), Alexander Ludwig (@alexanderludwig)
 discussions-to: https://github.com/AntSeed/antseed/discussions
-status: Draft
+status: Final
 type: Standards Track
 category: Core
 created: 2026-08-27
-requires: 3
 ---
 
 ## Abstract
 
-This AIP adds a routing peer role to AntSeed: a peer that, given a buyer's
-conversation and the network's live prices, returns a ranked list of
-`(model, peer)` candidates instead of serving inference itself. Buyers who opt
-in send a chat request whose model field is a sentinel rather than a concrete
-model id; a routing-aware `Router` plugin recognizes the sentinel, asks a
-routing peer to rank candidates, and dispatches through the network's existing
-failover walk exactly as it would for a fixed model choice.
+This AIP adds model routing to Antseed: a seller can offer a service that, given
+a buyer's conversation and a list of destinations the buyer allows, returns
+those destinations ranked best first instead of serving inference itself. The
+buyer sends the inference to the top destination and pays that seller normally.
+Later destinations are fallbacks.
 
-The proposal specifies three things: how a routing peer advertises itself and
-is discovered, without adding a new capability enum or a metadata codec
-version bump; the reserved request path a routing peer serves and its
-dispatch rules, modeled directly on [AIP-3](./aip-3.md)'s attestation route;
-and two new optional methods on the existing buyer-side
-`Router` interface that let a plugin pick model and seller together, ahead of
-AntSeed's existing fixed-model peer-selection pipeline, while that pipeline
-stays completely unmodified for any buyer who does not opt in.
+Routing is a service category, not one API. Each routing API is its own service
+API protocol, advertised and billed like any other service. The first protocol
+is `irp-suggest`, the suggest-only mode of the
+[Inference Routing Protocol](https://github.com/inference-routing/spec/blob/main/SPEC.md)
+(IRP). A ranking is billed as one `completed_requests` unit through the existing
+payment flow, only when it names at least one destination the buyer offered.
 
-This AIP makes no smart contract change and no payment-message change. How a
-routing peer charges for its service is left to a companion AIP; this one
-treats routing peers as offering their service for free, exactly like
-attestation.
+No router and no routing protocol is a default. This AIP makes no smart contract
+change, adds no payment message, and leaves the buyer-side `Router` plugin
+interface as it is. A buyer that selects no router behaves exactly as before.
 
 ## Motivation
 
-AntSeed lets a buyer pick a model and then finds the best-priced, most
-trustworthy seller of that exact model. It has no mechanism for a service
-that recommends *which model* to use in the first place, weighing quality
-against cost across the whole catalogue and across sellers. That
-recommendation only has value if it can see the network's real, live prices —
-which a buyer's own client already discovers — and if it can factor in
-per-conversation state, such as which seller already holds a warm cache of
-this conversation's prefix, that the recommending party cannot itself observe
-without the buyer's help. A routing peer is a natural role for this: an
-ordinary AntSeed seller node, paid like a seller, but one that returns a
-ranked list rather than an inference result.
+Antseed lets a buyer pick a model and then finds the best seller of that exact
+model. It has no mechanism for a service that recommends *which model* to use,
+weighing quality against cost across the catalogue and across sellers. That
+recommendation only has value if it sees the network's live prices, which the
+buyer's client already discovers, and per-conversation state, such as which
+seller already holds a warm cache of this conversation's prefix, which the
+recommending party cannot observe without the buyer's help.
 
-Two aspects of "just add a new capability" turn out not to work with what
-exists on the network today, which shapes this proposal's discovery design:
-
-- `ProviderCapability` and `PeerOffering`, the enum-and-topic mechanism that
-  looks like the obvious place for a new "routing" value, is unwired end to
-  end: no announcer call site ever populates `offerings`, and the
-  corresponding DHT lookup has no caller anywhere in the buyer path. Adding a
-  value there would not make a routing peer discoverable by anything that
-  exists today.
-- A peer that runs nothing but a routing handler and no inference `Provider`
-  does not announce to the DHT at all under the current node implementation,
-  because the announcer is only constructed when at least one provider is
-  registered. A routing-only peer would be unreachable by construction unless
-  this is fixed.
-
-Separately, the reserved-path pattern this proposal needs — a seller-side
-handler claiming its own URL prefix, served before provider matching and
-before payment — already exists for attestation ([AIP-3](./aip-3.md)). That
-AIP's capability-string advertisement, dispatch rules, and plugin-registration
-shape transfer to routing almost unchanged; this proposal
-follows that precedent deliberately rather than inventing a parallel one.
+A seller is a natural place for this role: it is already discoverable and already
+paid through the network. Treating routing as an ordinary service means it needs
+no new discovery mechanism, no reserved seller path, and no routing-specific
+payment code.
 
 ## Specification
 
@@ -77,374 +50,238 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
 "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
 document are to be interpreted as described in RFC 2119.
 
-### Routing Peer Role
+The complete wire format of `irp-suggest`, with examples, is in
+[`docs/protocol/model-routing.md`](https://github.com/AntSeed/antseed/blob/main/docs/protocol/model-routing.md).
+Its billing is in
+[`docs/protocol/unit-billing-services.md`](https://github.com/AntSeed/antseed/blob/main/docs/protocol/unit-billing-services.md).
+This section states the rules every implementation shares.
 
-A routing peer is an ordinary AntSeed seller node — the same `PaymentMux`,
-signed metadata, and connection handling any seller runs — that registers a
-routing handler and MAY register no inference `Provider` at all. A routing
-peer MUST NOT be required to run a `Provider` to be reachable; see
-Discovery below.
+### Routing protocols
 
-### Discovery
+A routing protocol is a service API protocol listed in `ROUTING_PROTOCOLS`.
+Billing metadata encodes protocols by list position, so new protocols MUST be
+appended and existing ones MUST NOT be reordered. Adding a protocol means adding
+its wire binding, a buyer adapter and a provider plugin that advertises it. It
+requires no change to this AIP's shared rules.
 
-A routing peer advertises support with the peer capability string
-`routing.v1` in `PeerMetadata.capabilities`, following the pattern
-[AIP-3](./aip-3.md) established for `verifier.<id>`: capability strings are
-appended to the existing v10+ capability list, so this requires no new
-`ProviderCapability` enum value, no DHT capability topic, and no
-`METADATA_VERSION` bump. `routing.v1` MUST conform to the existing capability
-grammar (`^[a-z0-9][a-z0-9.-]*$`, max 64 characters) and count against the
-existing per-peer capability limit (16). A future incompatible routing
-protocol revision MAY advertise `routing.v2` alongside or instead of
-`routing.v1`; a buyer that only understands `v1` MUST ignore capability
-strings it does not recognize.
+### Advertisement and discovery
 
-A peer's announcer MUST start, and MUST include `routing.v1` in its
-advertised capabilities, whenever a routing handler is registered, regardless
-of how many inference providers are also registered — including zero. A node
-implementation that only announces when at least one provider is registered
-MUST be corrected as part of implementing this AIP; a routing-only peer that
-never reaches the DHT is not a conforming implementation.
-
-A buyer discovers routing peers through its existing peer-discovery sweep
-(unchanged by this AIP) and filters the resulting peer set by the `routing.v1`
-capability string, the same way an [AIP-3](./aip-3.md) buyer filters for
-`verifier.*` capabilities. No new DHT topic, lookup call, or discovery
-round-trip is introduced.
-
-### Reserved Request Paths
-
-The path `/_antseed/route` (`ANTSEED_ROUTE_PATH`) is reserved. A seller MUST
-route a `POST` request for this path to its registered routing handler, and
-MUST do so before provider matching. A routing handler MUST be implemented
-as:
+A routing seller advertises a service in its signed peer metadata, the same way
+it advertises any other service: the service id, the routing protocol in
+`serviceApiProtocols`, and a `completed_requests` price in
+`serviceUnitBillingModels`:
 
 ```typescript
-interface RoutingServerHandler {
-  handleRoute(buyerPeerId: string, req: SellerRequest): SellerResponse | Promise<SellerResponse>
-}
+services: ['alpha-route'],
+serviceApiProtocols: { 'alpha-route': ['irp-suggest'] },
+serviceUnitBillingModels: {
+  'alpha-route': {
+    'irp-suggest': { version: 1, components: [{ unit: 'completed_requests', priceUsd: 0.001 }] },
+  },
+},
 ```
 
-`SellerRequest` is `{ method, path, headers?, body? }` and `SellerResponse` is
-`{ statusCode, headers, body }`, the same shapes [AIP-3](./aip-3.md) defines
-for `Prover`. A node MUST expose a single-slot registration for a routing
-handler (one routing identity per seller, unlike the name-keyed list of
-provers a seller MAY run), mirroring the buyer-side single `Router` slot this
-AIP also extends.
+A buyer finds routers through its existing discovery by filtering services on
+their API protocol. This AIP adds no capability string, no DHT topic and no
+metadata version.
 
-Dispatch rules:
+IRP paths name no service, so `irp-suggest` requires one service per seller. A
+node MUST refuse to start with two services of such a protocol, and a buyer MUST
+NOT select a peer that advertises two.
 
-- Exactly one routing handler MAY be registered per node. A `POST` to the
-  reserved path when no handler is registered MUST return `404` with error
-  code `not_routing_peer`.
-- Otherwise the seller MUST call `handleRoute(buyerPeerId, req)` and return
-  its `SellerResponse` unmodified. A handler that throws or rejects MUST come
-  back as a `500` response of type `routing_error` and MUST NOT crash request
-  handling.
-- A routing peer that gates on payment (left to a companion AIP; see Payments
-  below) MUST reject before calling into any ranking logic, with `402`, so an
-  unpaid caller never triggers the expensive part of the handler.
+### Endpoints (`irp-suggest`)
 
-### Wire Schemas
+| Endpoint | Cost | Purpose |
+| --- | --- | --- |
+| `GET /v1/routing/models` | Free | Models the router can rank (IRP §4) |
+| `POST /v1/routing/rank` | One completed request | Candidates ranked best first, for one user turn (IRP §5) |
 
-The `POST /_antseed/route` request body:
+Requests are plain IRP: they carry no Antseed headers or body fields, and seller
+identity stays on the buyer. The one Antseed addition is the optional
+`max_pricing` member on model-list entries, in USD per million tokens. An entry
+may be the wildcard `*`, meaning the router scores any model the buyer sends. IRP
+clients ignore unknown members, so the format stays IRP compatible. IRP proxy mode
+is not used.
 
-```typescript
-interface RouteRequestBody {
-  v: 1; // wire schema version
-  cqt: number; // cost/quality tradeoff, 0-10, buyer-chosen
-  inputMessage: string; // routing peer's own ranking-input format; opaque to this AIP
-  promptTokens: number; // buyer's own token estimate for inputMessage
-  expectedCachedTokens: Array<{
-    model: string; // candidate model this cache-hit estimate applies to
-    peer: string; // candidate peer this cache-hit estimate applies to
-    tokens: number; // tokens of this conversation's prefix the buyer has observed that peer/model already holding warm
-  }>;
-  constraints: {
-    maxInputUsdPerMillion?: number; // buyer's price ceiling; advisory pre-filter, not authoritative
-    minTrustScore?: number; // buyer's trust floor, 0-100 scale; advisory pre-filter, not authoritative
-    allowedPeerIds?: string[]; // buyer's explicit allow-list; advisory pre-filter, not authoritative
-    blockedPeerIds?: string[]; // buyer's explicit block-list; advisory pre-filter, not authoritative
-  };
-}
-```
+### Candidates
 
-`cqt` is a cost/quality tradeoff value on a 0–10 scale, buyer-chosen.
-`inputMessage` MUST be the routing peer's own input format for whatever
-ranking scheme it runs; this AIP does not standardize prompt content, only
-that a string field carries it. `expectedCachedTokens` lets the buyer report,
-per candidate it has itself observed billing for, how many tokens of this
-conversation's prefix that seller already holds warm — a routing peer MUST
-NOT be expected to track this itself, since a routing peer that retains no
-per-conversation history cannot observe it. `constraints` carries the buyer's
-own policy: a routing peer SHOULD use these fields to pre-filter its ranking,
-but a buyer MUST NOT rely on a routing peer's filtering as authoritative — see
-Rationale.
+The buyer MUST send only destinations its own trust, price, allow/block and pin
+filters allow. The same model from two sellers is two candidates.
 
-The `POST /_antseed/route` response body, on success:
+- `id` is `provider:model@peer`, or `sha256:` plus the hex SHA-256 of that string
+  when it is longer than 128 characters.
+- `model` is the router's own name for the model, from its model list. A seller's
+  service id matches a listed model exactly or by canonical model key. The buyer
+  still sends the seller's service id with the inference request.
+- `pricing` is the seller's price in USD per million tokens. A seller with no
+  cached-input price bills cache reads at the input price, so `cache_read` MUST
+  equal `input` in that case.
+- `expected_usage.cache_read_tokens` is the buyer's estimate of prompt tokens the
+  destination can serve from cache, from earlier turns of the conversation. It is
+  omitted when nothing was observed. A router is not expected to track it.
 
-```typescript
-interface RouteResponseBody {
-  v: 1; // wire schema version
-  ranked: Array<{
-    model: string; // candidate's model id
-    peer: string; // candidate's peer id
-    estimate: {
-      costUsd: number; // routing peer's predicted total cost for this candidate
-      inputTokens: number; // routing peer's predicted fresh input tokens
-      cachedInputTokens: number; // routing peer's predicted cached input tokens
-      outputTokens: number; // routing peer's predicted output tokens
-    };
-    price: {
-      inUsdPerM: number; // candidate's fresh input price, USD per million tokens
-      outUsdPerM: number; // candidate's output price, USD per million tokens
-      cachedInUsdPerM: number; // candidate's cached input price, USD per million tokens
-    };
-  }>;
-  router: string; // routing-peer-chosen identifier for which router/version produced this response; diagnostics only, not parseable
-}
-```
+A buyer MUST NOT send a candidate through a model entry whose `max_pricing` the
+candidate's price exceeds.
 
-`ranked` MUST be ordered by the routing peer's own objective, best candidate
-first. A host SHOULD treat this order as its routing decision and SHOULD
-NOT locally re-sort it by an independent signal such as reputation before
-walking it, since doing so would discard the quality/cost tradeoff the
-ranking encodes. The `Router` implementation returning this list to the host
-(inside `selectRoute`) is responsible for re-applying the buyer's own policy
-(allow/block lists, price and trust ceilings) before returning it, dropping
-disallowed entries rather than reordering around them — by the time the host
-receives and walks the list, it MUST already reflect that policy. `price`
-MUST be populated for every
-ranked entry, not only the winner, so a buyer can compute a savings figure
-against any candidate without a separate price lookup and without the
-routing peer needing to remember which candidates it offered to which buyer.
-`estimate` carries the routing peer's own per-candidate prediction, in the
-same units a buyer already reconciles against observed usage elsewhere in
-this protocol; it MUST be populated for every ranked entry, same as `price`.
-`router` is a single, routing-peer-chosen string identifying which
-router/version served this response, for a buyer's own logging or support
-diagnostics; this AIP does not standardize its format beyond being a plain
-string, and a buyer MUST NOT parse it for routing decisions.
+The rank `request` is the inference request as an OpenAI Chat Completions body.
+Other request formats are converted for the ranking only, and the buyer still
+sends the original request to the chosen seller. `routing.cost_quality_tradeoff`
+is a router option, an integer from `0` (best quality) to `10` (cheapest). It is
+omitted when the buyer has not chosen one, and the router then uses IRP's default
+of `5`.
 
-### Interface: `Router` Extensions
+### Rankings
 
-The existing buyer-side `Router` interface gains two new, all-optional
-methods. A `Router` that implements none of them is fully conforming and
-unaffected by this AIP; existing behavior for `selectPeer` and `onResult` is
-unchanged.
+The buyer MUST map each returned `candidate_id` through the candidates it sent and
+MUST NOT parse it. It MUST drop unknown and duplicate ids, and MUST reject a
+ranking if none remain. A router therefore cannot name a destination the buyer
+filtered out.
 
-```typescript
-interface Router {
-  // Existing, unchanged:
-  selectPeer(req: SerializedHttpRequest, peers: PeerInfo[]): PeerInfo | null; // fixed-model peer selection, predates this AIP
-  onResult(peer: PeerInfo, result: {
-    success: boolean;
-    latencyMs: number;
-    tokens: number;
-    // New, optional, additive fields on the existing result object:
-    freshInputTokens?: number; // observed fresh (non-cached) input tokens for this request
-    cachedInputTokens?: number; // observed cached input tokens for this request
-    outputTokens?: number; // observed output tokens for this request
-    estimatedCostUsd?: number | null; // observed cost for this request, same computation buyer-proxy already derives at both onResult call sites
-    requestId?: string; // the originating client request's id, stable across a peer walk for one client request; lets a router pair this result with the selectRoute decision that produced it
-  }): void;
+The buyer sends the inference to the first ranked candidate and MAY fall back to
+later candidates on retryable inference errors, without paying for another
+ranking. Tool-loop continuations of the same user turn SHOULD reuse the ranking
+(IRP §7). Optional predictions (`expected_quality`, `expected_cost_usd`,
+`expected_usage`, `reasoning_effort`) are kept when well-formed.
 
-  // New, all optional:
-  selectRoute?(
-    req: SerializedHttpRequest, // raw, unmodified request -- a plugin reads its own sentinel from req.body itself
-    peers: PeerInfo[], // the buyer's currently discovered peer set
-    conversation: ConversationIdentity | null, // identity of the chat this request belongs to, null when it can't be determined
-    routingPreferences: ModelRoutingPreferences | null, // the buyer's current routing preferences
-    defaultRoutedModel?: string | null, // the pre-existing "antseed" alias's currently-resolved target, host-owned state
-  ): Promise<RouteCandidate[] | null>; // null is a decline, falling through to the unmodified fixed-model pipeline
+### Errors (`irp-suggest`)
 
-  getRoutingDecisions?(): RoutingDecisionRow[]; // the router's own local routing_decisions ledger, if it keeps one, for a host's savings-dashboard UI
-}
+Routers answer errors with IRP problem details (`application/problem+json`,
+RFC 9457). The seller node uses the same format for the free models endpoint, and
+answers it with a 404 problem when it offers no routing service.
 
-type RouteCandidate = {
-  peer: PeerInfo; // the candidate seller's full discovered peer record
-  peerId: string; // the candidate seller's peer id
-  serviceId: string; // the model this candidate serves
-  request: SerializedHttpRequest; // already model-substituted for this candidate
-  reputation: number; // the candidate's reputation, 0-100 scale
-  hasCachedInputPricing: boolean; // whether the candidate advertises a cached-input price for this service
-  inputUsdPerMillion: number | null; // the candidate's advertised fresh input price, null if unadvertised
-  outputUsdPerMillion: number | null; // the candidate's advertised output price, null if unadvertised
-  minImageUsdPerImage: number | null; // the candidate's advertised image-generation price, null for a non-image service
-};
+| Status | `type` | Buyer action |
+| --- | --- | --- |
+| 400 | `urn:irp:problem:invalid-request` | Fail the turn |
+| 402 | `urn:irp:problem:payment-required` | Existing payment negotiation |
+| 422 | `urn:irp:problem:no-scorable-candidate` | Refresh the model list and retry once, then fail the turn |
+| 503 | `urn:irp:problem:unavailable` | Fail the turn; `Retry-After` may be set |
 
-type RoutingDecisionRow = {
-  atMs: number; // wall-clock time this decision was made
-  actualModel: string; // the model actually used
-  actualPeer: string; // the peer actually used
-  actualPromptTokens: number; // observed prompt tokens, fresh and cached combined
-  actualCachedTokens: number; // observed cached-subset of actualPromptTokens
-  actualCompletionTokens: number; // observed output tokens
-  actualUsdcPaid: number; // what actually settled for this request; not a billing record itself, real settlement is governed by the signed SpendingAuth
-  predictedCostUsd: number | null; // this decision's own predicted cost, captured at selectRoute time; null when the gate skipped the call entirely
-  predictedInputTokens: number | null; // predicted fresh input tokens; null when the gate skipped the call entirely
-  predictedCachedInputTokens: number | null; // predicted cached input tokens; null when the gate skipped the call entirely
-  predictedOutputTokens: number | null; // predicted output tokens; null when the gate skipped the call entirely
-  cqt: number; // the cost/quality dial value in effect for this decision
-  routingLatencyMs: number | null; // wall-clock time the routing call itself took; null when the gate skipped the call entirely (e.g. a reused decision)
-  baselinePrices: Record<string, { inUsdPerM: number; outUsdPerM: number; cachedInUsdPerM: number | null }>; // best available price per fixed, curated baseline model actually offered in this decision's ranked response, keyed by model name, absent when a baseline model wasn't offered; lets a savings dashboard compare against a fixed reference without a live price table
-};
+### Billing
 
-type ConversationIdentity = {
-  tool: string; // slug for the originating tool (e.g. 'claude-code', 'codex', 'opencode', 'unknown')
-  sessionKey: string; // stable per-conversation key as sent by the tool
-  parentSessionKey: string | null; // parent session for subagent traffic, when the tool advertises one
-  isUserThread: boolean; // false when the tool declares this thread its own housekeeping rather than a user's chat; true by default
-};
+One `completed_requests` unit is charged per well-formed ranking that names at
+least one candidate the buyer sent. Errors and malformed rankings are not billed.
+Buyer and seller MUST apply the same billing check to the same response bytes, so
+they agree on the charge. Routing uses the existing unit-billing and payment flow:
+this AIP adds no `MessageType` value, EIP-712 struct or Solidity contract. A
+ranking and the inference it leads to are separate purchases, and a ranking is not
+refunded when the inference fails.
 
-type ModelRoutingPreferences = {
-  preferFreePeers: boolean; // prefer $0-priced candidates when ranking
-  maxInputUsdPerMillion: number; // buyer's price ceiling
-  minTrustScore: number; // buyer's trust floor, 0-100 scale
-  allowedPeerIds: string[]; // buyer's explicit allow-list
-  blockedPeerIds: string[]; // buyer's explicit block-list
-  cqt?: number; // cost/quality tradeoff dial, one of the five discrete values {1,3,5,7,9}; only meaningful to a router that implements selectRoute
-};
-```
+### Buyer selection
 
-`ModelRoutingPreferences` is buyer routing preference data, not `Router`
-configuration — a routing peer's own setup (its URL, credentials, seller
-identity) lives in whatever plugin-configuration mechanism the host already
-uses for its other plugins, not in this type or on the wire. A `Router`
-implementation MUST be fully configurable through its own plugin
-configuration alone; it MUST NOT require `ModelRoutingPreferences` to carry
-anything beyond the buyer-facing preference fields already listed above. This
-excludes payment-model-specific consent, too: whether a buyer has opted into
-a subscription-priced router's daily signing is not a preference every
-router shares a use for (a metered or free router has nothing to check it
-against), so it is not part of this type either — a subscription-priced
-`Router` implementation reads that consent from its own plugin
-configuration, the same place its other setup lives, never treating an
-absent or unreadable value as consent.
+A router MUST be selected by the buyer. Implementations SHOULD offer a default
+route, a per-conversation selection, and pinning a router as the model
+(`"model": "<routerPeerId>@<routerServiceId>"`). In the reference buyer proxy a
+default router is set with `POST /_antseed/route`
+(`{ "router": { "service", "options"?, "allowedModels"? } }`), and
+`GET /v1/models?type=router` lists each router's `protocol` and `options`. These
+are local client APIs, not part of the peer protocol.
 
-A host (buyer proxy) implementation MUST call `selectRoute` before its
-existing fixed-model peer-narrowing step, whenever the registered `Router`
-implements it, and MUST treat a `null` result — including a `Router` that
-does not implement `selectRoute` at all — as a decline, falling through to
-the unmodified existing pipeline with no other change in behavior. A host
-MUST pass the request exactly as received, before any host-level model-alias
-substitution the buyer applies for its own purposes; a plugin recognizes its
-own sentinel model value from `req.body` itself. A host MUST NOT hardcode,
-special-case, or validate against any specific sentinel string — that
-recognition is entirely the plugin's business, so that different `Router`
-implementations MAY choose different sentinels without any host change.
+Router options travel in the protocol's own terms. A buyer MUST keep them opaque
+in transport and MUST check them against the option specs of the router's protocol
+before buying a ranking. Before paying for a ranking, a pinned router MUST pass
+the same allow/block, trust and reputation checks as a pinned seller.
 
-When `selectRoute` returns a non-null list, the host SHOULD walk it in the
-returned order using its existing per-candidate failover mechanism (fail over
-before the first token of a response, terminal after), SHOULD NOT re-sort it
-locally, and MUST call `onResult` for the peer actually used exactly as it
-does for a fixed-model selection. A host MUST forward the buyer's current
-`routingPreferences` to `selectRoute` on every call.
+### `Router` plugin interface
 
-A `Router` MUST NOT be given direct access to the buyer's payment-signing
-key or payment manager. This AIP defines no signing mechanism of its own; a
-`Router` that needs to trigger its own periodic signing (for example, a
-subscription-priced routing peer) gets that capability from whatever
-companion pricing AIP defines it, and that mechanism MUST itself be a
-host-provided closure the router calls, never a direct reference to the
-buyer's signer.
-
-### Payments
-
-This AIP specifies no smart contract change and no payment-message change. It does
-not add, remove, or modify any `MessageType` value, any EIP-712 struct, or
-any Solidity contract. A routing peer served under this AIP is unpriced,
-exactly like attestation under [AIP-3](./aip-3.md); the `402` gate described
-under Reserved Request Paths is a hook this AIP reserves for a companion AIP
-to fill in, not something this AIP itself defines the mechanism for. How a
-routing peer charges — flat-rate subscription pricing, per-request metering,
-or something else — is left entirely to that companion proposal.
+The buyer-side `Router` plugin interface (`selectPeer`, `onResult`) is unchanged.
+Routing services run beside it, in the buyer's routing path, so a `Router` plugin
+needs no change. Router code never receives direct access to the buyer's signer or
+payment manager.
 
 ## Rationale
 
-**Modeled on AIP-3's attestation design, not a new pattern.**
-[AIP-3](./aip-3.md) already solved this exact shape of problem: a seller-side
-handler on a reserved path, served before provider matching and payment,
-advertised as a capability string. This AIP reuses that shape rather than
-inventing a parallel one. Two specific choices follow
-from it: `routing.v1` is a capability *string*, not a new `ProviderCapability`
-enum value, because the DHT machinery that enum would need is unwired end to
-end and the capability-string path already works in production; and a routing
-peer's announcer MUST start even with zero registered providers, since a
-peer whose entire purpose is ranking rather than serving is the normal case
-for this role, not a corner case to work around.
+**Routing as an ordinary service.** An earlier version of this AIP defined a
+`routing.v1` capability string, a reserved `/_antseed/route` seller path, and new
+optional methods on the `Router` plugin, with payment left to a companion AIP. The
+implementation shows none of those are needed. Services already give discovery,
+signed advertisement, per-service pricing and the existing payment flow, so a router
+is a provider plugin and a buyer needs one routing client. `/_antseed/route` remains
+in use only as a local buyer-proxy API.
 
-**The routing peer's ranked order is a suggestion, not a binding decision.**
-The order encodes a quality/cost tradeoff a buyer can't independently
-recompute from price and reputation alone, so a host SHOULD NOT locally
-re-sort it — that would discard the tradeoff the ranking exists to provide.
-But the routing peer's own `constraints` filtering is advisory only, since a
-host has no way to verify a remote routing peer actually applied it
-correctly: a `Router` implementation MUST still re-apply the buyer's own
-price/trust/allow-block policy itself, inside `selectRoute`, dropping
-disallowed candidates before ever returning the list to the host. Policy
-filters the given order in place; it never re-ranks it.
+**An open wire format.** IRP is an open protocol, so any IRP router can be offered
+through Antseed unchanged, and Antseed adds only one optional member that IRP clients
+ignore. An Antseed-specific schema would require every router to implement a format
+used nowhere else.
 
-**Sentinel strings stay inside the plugin.** A host that recognized one
-router's sentinel model string by name would privilege that implementation
-over any other `Router` a buyer might load. The host forwards the request
-unmodified; only the plugin knows what its own sentinel means.
+**Pluggable protocols, no default.** Making IRP one protocol rather than the standard
+lets other routing APIs join without reopening this AIP, the same way video APIs are
+separate protocols. Having no default keeps the network from privileging one router.
 
-**Pricing is deliberately out of scope here.** This AIP treats a routing
-peer as free, the same bootstrapping path attestation took — bundling a
-pricing scheme into this proposal would force reviewers to accept or reject
-both together. A companion pricing AIP can specify whatever metered or
-subscription mechanism a priced routing peer needs, without reopening
-anything specified here.
+**Bill only usable rankings.** A router is paid for an answer the buyer can use. A
+ranking naming no offered candidate has no value and costs nothing.
+
+**The buyer owns the candidate set.** Sending only allowed candidates, and mapping
+answers back through them, enforces buyer policy by construction, instead of asking
+a remote party to apply it.
 
 ## Backwards Compatibility
 
-This proposal is additive. A peer that advertises no `routing.v1` capability
-is unaffected by this AIP; a `Router` implementation that does not implement
-either of the two new optional methods is unaffected and behaves exactly as it
-does today. The `/_antseed/route` path is newly reserved, so a seller MUST
-NOT route it to a provider — though it was never a valid model or service
-id, so no existing conforming seller can already be using it for anything
-else. No metadata codec
-version bump, no `METADATA_VERSION` change, and no payment-message change is
-required. Mixed-version networks interoperate: a routing-aware buyer skips
-peers that advertise no `routing.v1` capability, and a routing-advertising
-peer is ignored by buyers that do not implement `selectRoute` at all, exactly
-as [AIP-3](./aip-3.md) describes for verifier capabilities.
+The proposal is additive for buyers that select no router and for sellers that offer
+none. Routing services use the unit-billing metadata introduced at peer metadata
+v11 and require no metadata version of their own. A buyer too old to know
+`completed_requests` rejects the whole announcement of a seller that advertises it,
+so an operator SHOULD run a routing service on a separate peer until those buyers
+have upgraded.
+
+No `routing.v1` capability, reserved seller path or `Router` extension from the
+earlier draft ever shipped, so nothing on the network depends on them. The earlier
+`/v1/routing/describe` and `recommendations` format from pre-release branches has no
+compatibility layer.
+
+## Test Cases
+
+In the [antseed repository](https://github.com/AntSeed/antseed):
+
+- `packages/protocol/src/irp.test.ts`, `packages/protocol/src/routing.test.ts`: wire
+  validation and billable-ranking checks.
+- `packages/router-core/src/model-routing-client.test.ts`: the buyer client.
+- `apps/cli/src/proxy/router-execution.test.ts`, `apps/cli/src/proxy/routing-services.test.ts`,
+  `apps/cli/src/gateway/routing-through-gateway.test.ts`: candidate building, dispatch and
+  selection.
+- `e2e/tests/routing-payment-flow.test.ts`: a paid ranking through the payment flow.
+
+## Reference Implementation
+
+Merged in [Antseed/antseed#1232](https://github.com/Antseed/antseed/pull/1232) and
+[#1233](https://github.com/Antseed/antseed/pull/1233):
+
+- `packages/protocol/src/routing.ts`, `packages/protocol/src/irp.ts`: protocols,
+  wire binding and validators.
+- `packages/router-core/src/model-routing-client.ts`,
+  `packages/router-core/src/routing-adapters/`: protocol-neutral buyer client and
+  the IRP adapter.
+- `apps/cli/src/proxy/router-execution.ts`: candidate building and dispatch.
+- `plugins/provider-irp-router`, `plugins/provider-free-model-router`: seller plugins.
+
+Not implemented: IRP proxy mode, and applying `reasoning_effort` to the inference
+request (it is carried with the recommendation only).
 
 ## Security Considerations
 
-**Unmetered ranking is a denial-of-service surface.** Ranking MAY be
-expensive (a separate scoring process). This AIP defines no payment gate —
-an operator MUST put its own payment or cost-control gate in front of a
-routing peer before running it against real traffic.
+**Prompt content leaves the buyer's device.** The router receives the whole
+conversation on every paid ranking, in addition to the seller that answers it. Two
+parties see the prompt instead of one. A buyer SHOULD only select a router it would
+trust with that content, and SHOULD be able to see which router it is using. Selecting
+no router sends nothing to one.
 
-**Prompt content leaves the buyer's device.** `inputMessage` gives the
-routing peer itself access to conversation content on every routed request —
-in addition to, not instead of, whichever inference seller ultimately
-answers it. Routing a request means two parties see the prompt instead of
-one. A buyer SHOULD trust a routing peer the way it trusts any seller it
-sends prompts to, and SHOULD be able to see which peer identity it's routing
-through.
+**A dishonest router can steer, but cannot override policy.** A router can bias its
+order toward affiliated sellers. It cannot name a destination outside the set the buyer
+offered, so it cannot make a buyer pay outside its own price, trust or allow/block
+bounds. A router also sees each candidate's price and id, and can use them to learn per
+seller. Buyers choose routers, and can leave one, as they do with sellers.
 
-**A dishonest routing peer can steer, but not override, a buyer's policy.**
-Because a host that follows it treats the returned order as its routing
-decision, a compromised routing peer could bias its ranking toward
-affiliated sellers. This is bounded, not eliminated: a `Router`
-implementation MUST re-apply the buyer's own `constraints` locally before
-dispatch rather than trusting the routing peer's own filtering (which is
-advisory, not authoritative — see Rationale), so a routing peer can bias an
-ordering but cannot force a buyer to pay outside its own price, trust, or
-allow/block bounds.
+**Spend per ranking.** A ranking is a separate purchase at the router's advertised
+price, and routing charges count toward the conversation's spend. Token and image price
+caps do not apply to a router, and there is no per-key cap on the ranking price yet, so
+a buyer selecting a router accepts its advertised price. Reusing a ranking across a
+tool loop bounds repeat charges within one user turn.
 
-**Plugins never hold a buyer's signing key.** None of this AIP's own new
-`Router` methods expose signer access, since this AIP defines no signing
-mechanism. Any signing capability a companion pricing AIP adds MUST follow
-the same closure-based pattern established elsewhere in this protocol: a
-`Router` — including a third-party one — gets a host-provided closure to
-call, never the buyer's actual private key or a handle that can sign
-arbitrary messages. A host implementation MUST NOT expose its payment
-manager or signer directly to plugin code.
+**Denial of service.** The free model list is not rate-limited by the seller node; the
+router limits its own list. Ranking is billed, and the seller's normal payment checks
+apply before it runs. The buyer caches the model list for 60 seconds.
+
+**Keys.** Routing adds no signing mechanism. Rankings are paid through the buyer's
+existing payment manager, and router code gets no handle on the signer.
 
 ## Copyright
 
